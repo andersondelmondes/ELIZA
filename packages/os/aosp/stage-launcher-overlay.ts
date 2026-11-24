@@ -515,8 +515,6 @@ export function renderNativeOverlay(
   const nativeModules = records.map((_, i) => `${d.moduleName}_native_${i}`);
   const partitionProperty =
     partition === "product" ? "    product_specific: true,\n" : "";
-  // AOSP reserves prebuilt_priv_app for generated rules. Both fixed-directory
-  // native rules require the reviewed patch, including privileged launchers.
   const nativeRule = privileged
     ? "prebuilt_priv_app_native"
     : "prebuilt_app_native";
