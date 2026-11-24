@@ -70,7 +70,7 @@ function preparePlaces(operation: PlaceOperation, params: Params): PreparedPlace
       } }
     }
     if (target === "UsePlaceName") delete accepted[id]
-    if (required && params[name] === undefined && givenBy.every((key) => accepted[key] === undefined)) missing.push(`Missing required argument '${name}'`)
+    if (required && params[name] === undefined && [id, ...givenBy].every((key) => accepted[key] === undefined)) missing.push(`Missing required argument '${name}'`)
   }
   if (missing.length === 0) return { kind: "ready", params: accepted }
   return { kind: "refused", result: {

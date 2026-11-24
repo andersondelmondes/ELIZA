@@ -486,6 +486,13 @@ it.effect(`Read the managed inbox fresh for the current account, and hand a new 
   assert.deepEqual(mail.kind === "mail" && mail.messages.map((message) => message.id), ["m1"])
   const accepted = cloud.state.paths.splice(0)
 
+  cloud.state.pages.set("", { messages: [{ ...card("m1", "Tom &amp; Jerry"), snippet: "It&#39;s &amp;amp; here\u200b\u200b\u200b now &bogus; &#xD800;" }], next: null, history: "41" })
+  assert.deepEqual(managedReadResult(try managedInboxRead(cloud.client, { limit: 1 })).data?.messages, [{
+    id: "m1", threadId: "t-m1", from: "Bo <bo@example.com>", subject: "Tom & Jerry", snippet: "It's &amp; here now &bogus; \ufffd",
+    receivedAt: "2026-11-20T10:00:00.000Z", unread: true,
+  }])
+  cloud.state.paths.splice(0)
+
   cloud.state.afterSearch = () => { work.capabilities = [...readOnly] }
   assert.deepEqual(try managedInboxRead(cloud.client, { limit: 5 }), { kind: "refused", reason: "several-accounts" })
   assert.deepEqual(cloud.state.paths.splice(0), readCalls)
@@ -502,13 +509,6 @@ it.effect(`Read the managed inbox fresh for the current account, and hand a new 
   cloud.state.afterSearch = () => { cloud.state.refuse = { status: 503, error: "temporarily_unavailable" } }
   assert.deepEqual(try managedInboxRead(cloud.client, { limit: 5 }), { kind: "failed", failure: "unavailable" })
   assert.deepEqual(cloud.state.paths.splice(0), readCalls)
-
-  cloud.state.pages.set("", { messages: [{ ...card("m1", "Tom &amp; Jerry"), snippet: "It&#39;s &amp;amp; here\u200b\u200b\u200b now &bogus; &#xD800;" }], next: null, history: "41" })
-  assert.deepEqual(managedReadResult(try managedInboxRead(cloud.client, { limit: 1 })).data?.messages, [{
-    id: "m1", threadId: "t-m1", from: "Bo <bo@example.com>", subject: "Tom & Jerry", snippet: "It's &amp; here now &bogus; \ufffd",
-    receivedAt: "2026-11-20T10:00:00.000Z", unread: true,
-  }])
-  cloud.state.paths.splice(0)
 
   cloud.state.afterSearch = () => {
     personal.connected = false
