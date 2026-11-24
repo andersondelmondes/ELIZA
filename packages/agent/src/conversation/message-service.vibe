@@ -131,7 +131,12 @@ function kindOf(type: string): AttachedKind {
 
 function bytesOf(url: string): Uint8Array | undefined {
   const comma = url.indexOf(",")
-  return url.startsWith("data:") && url.slice(0, comma).endsWith(";base64") ? Buffer.from(url.slice(comma + 1), "base64") : undefined
+  if (!url.startsWith("data:") || !url.slice(0, comma).endsWith(";base64")) return undefined
+  try {
+    return Uint8Array.from(atob(url.slice(comma + 1)), (char) => char.charCodeAt(0))
+  } catch {
+    return undefined
+  }
 }
 
 function utf8(bytes: Uint8Array): string | undefined {
