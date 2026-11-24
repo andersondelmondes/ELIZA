@@ -240,6 +240,7 @@ pure def unusableAnswerReply(startingDirections: bool): UnusableAnswerReply =
   if (startingDirections) StartNotPlanned else UnusableAnswer
 pure def lawOnlyAStartNamesThePlaceItCouldNotLookUp(startingDirections: bool): bool =
   (unusableAnswerReply(startingDirections) == StartNotPlanned) iff startingDirections
+```
 
 ### A first result named as asked is taken when the others are parts of it or mostly around it
 
