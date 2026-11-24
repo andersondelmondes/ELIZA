@@ -458,7 +458,7 @@ it.live(`A text or JSON file reaches the model as its text, cut at its bound on 
   const cloud = try cloudFake(deviceKey)
   const agent = try cloudAgent(cloud)
   const { id } = try conversation(agent)
-  const encoded = (bytes: string | readonly number[]) => Buffer.from(typeof bytes === "string" ? bytes : Uint8Array.from(bytes)).toString("base64")
+  const encoded = (bytes: string | readonly number[]) => btoa(String.fromCharCode(...(typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes)))
   const attached = (name: string, mimeType: string, bytes: string | readonly number[]) => ({ name, mimeType, data: encoded(bytes) })
   const turnParts = () => {
     const body = cloud.calls.filter(({ path }) => path.endsWith("/chat/completions")).at(-1)?.body as { messages: { content?: unknown }[] }
