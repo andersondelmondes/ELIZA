@@ -1,4 +1,8 @@
-// spec/inbox/reads.md, "Pages keep their first read's identity and expose mailbox shifts"; spec/inbox/drafts.md, "Recovery reads the recorded request and cannot resend it"; spec/inbox/outgoing.md, "A saved attachment of any type is a checked byte copy, never opened"; spec/inbox/display.md, "Only an absolute web link without credentials is kept, and its shown text is plain"
+// spec/inbox/reads.md, "Pages keep their first read's identity and expose mailbox shifts"; spec/inbox/reads.md, "A message names where its replies go only as one literal address, and marks attachments only as Cloud hinted"; spec/inbox/reads.md, "An answer outside the bounds of its read is refused whole"; spec/inbox/drafts.md, "Recovery reads the recorded request and cannot resend it"; spec/inbox/outgoing.md, "A saved attachment of any type is a checked byte copy, never opened"; spec/inbox/outgoing.md, "An account's capabilities are read from the kinds Cloud offers and its one attachment cap"; spec/inbox/display.md, "Only an absolute web link without credentials is kept, and its shown text is plain"
+import { attachmentsOffered, capAdmitted, forwardOffered, maximumFiles } from "../../gen/inbox__outgoing.effect.vibe"
+import {
+  attachmentMark, followingAdmitted, listedAdmitted, receiptAdmitted, replyToKept, searchAnswerAdmitted, threadAnswerAdmitted, tokenAdmitted,
+} from "../../gen/inbox__reads.effect.vibe"
 import { reviewOpaqueAttachment, type MailAttachmentReviewer, type OpaqueMailAttachment, type ReviewedMailAttachment } from "../mailbox/attachments.vibe"
 import { utf8Length } from "../mailbox/digest.vibe"
 import { MailProtocolFailed, type MailFailure, type MailUnreachable } from "../mailbox/failures.vibe"
@@ -22,10 +26,9 @@ export type SearchSize = 10 | 25 | 50 | 100
 const google = "/api/v1/eliza/google"
 const inbox = `${google}/gmail/inbox-v1`
 const dispatchTimeoutMs = 45_000
-const maxLinks = 50
 const maxHtmlBytes = 512 * 1024
 const sha = /^[a-f0-9]{64}$/
-const revision = /^\d{1,20}$/
+const digitsOf = (revision: string) => /^\d+$/.test(revision) ? revision.length : 0
 const labelKinds: readonly GmailInboxOperationKind[] = ["archive", "unarchive", "trash", "untrash"]
 
 const invalid = () => new MailProtocolFailed({ code: "invalid-response", status: 0, reason: "" })
@@ -43,12 +46,16 @@ function query(entries: Readonly<Record<string, string | undefined>>): string {
   return new URLSearchParams(Object.entries(entries).flatMap(([name, value]) => value === undefined ? [] : [[name, value]])).toString()
 }
 
+const hinted = { MarkUnknown: {}, MarkAttached: { hasAttachments: true }, MarkPlain: { hasAttachments: false } } as const
+
 function senderEmail(from: string): string | null {
   const candidate = (/<([^<>]+)>\s*$/.exec(from)?.[1] ?? from).trim()
   return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(candidate) ? candidate.toLowerCase() : null
 }
 
 effect function messageOf(card: typeof MailCardWire.Type): GmailMessage!MailProtocolFailed {
+  const address = senderEmail(card.replyTo ?? "")
+  const replyTo = replyToKept(typeof card.replyTo === "string", address !== null) ? address : null
   return {
     id: try present(card.id),
     threadId: try present(card.threadId),
@@ -57,6 +64,8 @@ effect function messageOf(card: typeof MailCardWire.Type): GmailMessage!MailProt
     fromEmail: senderEmail(card.from),
     to: card.to,
     cc: card.cc,
+    ...(replyTo === null ? {} : { replyTo }),
+    ...hinted[attachmentMark(card.hasAttachments !== undefined, card.hasAttachments === true)],
     snippet: card.snippet,
     receivedAt: try present(card.receivedAt),
     unread: card.isUnread,
@@ -74,7 +83,7 @@ function accountOf(row: typeof ConnectionWire.Type): GmailAccount {
 }
 
 effect function readOf(value: typeof MessageWire.Type, historyId: string | null): GmailReadResult!MailProtocolFailed {
-  const links = linkifyMailText(value.bodyText)
+  const found = linkifyMailText(value.bodyText)
   const html = value.bodyHtml
   const shownHtml = html !== null && value.bodyHtmlStatus === "available" && utf8Length(html) <= maxHtmlBytes ? html : undefined
   return {
@@ -82,8 +91,8 @@ effect function readOf(value: typeof MessageWire.Type, historyId: string | null)
     bodyText: value.bodyText,
     ...(shownHtml === undefined ? {} : { bodyHtml: shownHtml }),
     ...(shownHtml === undefined && (value.bodyHtmlStatus === "too_large" || html !== null) ? { bodyHtmlOmitted: true } : {}),
-    links: links.slice(0, maxLinks),
-    ...(links.length > maxLinks ? { omittedLinks: links.length - maxLinks } : {}),
+    links: found.links,
+    ...(found.omitted > 0 ? { omittedLinks: found.omitted } : {}),
     historyId,
     attachments: value.attachments.map((row) => ({ ...row })),
     authenticationResults: value.authenticationResults ?? null,
@@ -92,7 +101,7 @@ effect function readOf(value: typeof MessageWire.Type, historyId: string | null)
 
 effect function receiptOf(value: typeof OperationWire.Type, requestId: string): GmailInboxReceipt!MailProtocolFailed {
   const receipt = value.receipt
-  if (receipt.requestId !== requestId || !sha.test(receipt.reviewDigest) || (receipt.state === "succeeded") !== (receipt.providerResult !== null)) throw invalid()
+  if (!receiptAdmitted(receipt.requestId === requestId, sha.test(receipt.reviewDigest), receipt.state === "succeeded", receipt.providerResult !== null)) throw invalid()
   return {
     requestId,
     kind: receipt.kind,
@@ -107,7 +116,7 @@ function capabilitiesOf(value: typeof CapabilitiesWire.Type): GmailInboxCapabili
   const kinds = value.kinds
   const has = (...wanted: readonly GmailInboxOperationKind[]) => wanted.every((kind) => kinds.includes(kind))
   const providerDrafts = has("draft-create", "draft-replace", "draft-delete")
-  const maximumBytes = Math.max(0, value.attachmentPolicy.maxBytes)
+  const maximumBytes = value.attachmentPolicy.maxBytes
   return {
     version: 1,
     from: value.from,
@@ -116,26 +125,26 @@ function capabilitiesOf(value: typeof CapabilitiesWire.Type): GmailInboxCapabili
     send: has("send"),
     providerDrafts,
     mailboxMutations: has(...labelKinds),
-    attachments: maximumBytes > 0,
+    attachments: attachmentsOffered(maximumBytes),
     providerExactlyOnce: false,
     atomicDraftReplacement: false,
     readState: has("mark-read", "mark-unread"),
     stars: has("star", "unstar"),
     draftsList: providerDrafts,
-    forwardAttachments: has("send") || providerDrafts,
+    forwardAttachments: forwardOffered(has("send"), providerDrafts),
     searchTrash: true,
-    opaqueAttachments: maximumBytes > 0,
-    attachmentPolicy: { maximumOutgoing: 10, maximumBytes, maximumTotalBytes: maximumBytes, mimeTypes: value.attachmentPolicy.mimeTypes },
+    opaqueAttachments: attachmentsOffered(maximumBytes),
+    attachmentPolicy: { maximumOutgoing: maximumFiles, maximumBytes, maximumTotalBytes: maximumBytes, mimeTypes: value.attachmentPolicy.mimeTypes },
   }
 }
 
-effect function nextToken(next: string | null, asked: string | undefined): (string | null)!MailProtocolFailed {
-  if (next !== null && (next === "" || next.length > 4096 || next === asked)) throw invalid()
-  return next
+effect function nextToken(following: string | null, asked: string | undefined): (string | null)!MailProtocolFailed {
+  if (!followingAdmitted(following !== null, following?.length ?? 0, following !== null && following === asked)) throw invalid()
+  return following
 }
 
 effect function pageToken(token: string | undefined): void!MailProtocolFailed {
-  if (token !== undefined && (token === "" || token.length > 4096)) throw invalid()
+  if (token !== undefined && !tokenAdmitted(token.length)) throw invalid()
 }
 
 export function managedGmailClient(transport: ManagedGmailTransport) {
@@ -168,7 +177,7 @@ export function managedGmailClient(transport: ManagedGmailTransport) {
     effect gmailSearch(grantId: string, search: string, maxResults: SearchSize = 25, token?: string): GmailSearchPage!MailFailure {
       try pageToken(token)
       const page = try decoded(SearchWire, try call(`${google}/gmail/search?${query({ side: "owner", grantId: try present(grantId), query: try present(search), maxResults: String(maxResults), pageToken: token })}`))
-      if (!revision.test(page.mailboxHistoryId) || page.messages.length > maxResults) throw invalid()
+      if (!searchAnswerAdmitted(maxResults, page.messages.length, digitsOf(page.mailboxHistoryId))) throw invalid()
       const messages: GmailMessage[] = []
       for (const card of page.messages) messages.push(try messageOf(card))
       return { messages, syncedAt: try present(page.syncedAt), nextPageToken: try nextToken(page.nextPageToken, token), mailboxHistoryId: page.mailboxHistoryId, supportsSpamTrash: page.supportsSpamTrash }
@@ -183,6 +192,7 @@ export function managedGmailClient(transport: ManagedGmailTransport) {
     effect gmailInboxCapabilities(grantId: string): GmailInboxCapabilities!MailFailure {
       const value = try decoded(CapabilitiesWire, try call(`${inbox}/capabilities?${query({ grantId: try present(grantId) })}`))
       try present(value.from)
+      if (!Number.isSafeInteger(value.attachmentPolicy.maxBytes) || !capAdmitted(value.attachmentPolicy.maxBytes)) throw invalid()
       return capabilitiesOf(value)
     },
 
@@ -191,10 +201,10 @@ export function managedGmailClient(transport: ManagedGmailTransport) {
         grantId, threadId, offset: cursor === undefined ? undefined : String(cursor.offset), historyId: cursor?.historyId,
       })}`))
       const offset = cursor?.offset ?? 0
-      if (value.threadId !== threadId || value.messages.length > 25 || !Number.isSafeInteger(value.total) || value.offset !== offset ||
-        value.total < offset + value.messages.length || value.total > 2000 ||
-        value.nextOffset !== (offset + value.messages.length < value.total ? offset + value.messages.length : null) ||
-        (cursor !== undefined && cursor.historyId !== value.historyId) || !revision.test(value.historyId)) throw invalid()
+      if (value.threadId !== threadId || ![offset, value.offset, value.total, value.nextOffset ?? 0].every((whole) => Number.isSafeInteger(whole)) || !threadAnswerAdmitted({
+        askedOffset: offset, offset: value.offset, count: value.messages.length, total: value.total, continues: value.nextOffset !== null,
+        nextOffset: value.nextOffset ?? 0, revisionKept: cursor === undefined || cursor.historyId === value.historyId, digits: digitsOf(value.historyId),
+      })) throw invalid()
       const messages: GmailReadResult[] = []
       for (const row of value.messages) {
         if (row.message.threadId !== threadId) throw invalid()
@@ -222,7 +232,7 @@ export function managedGmailClient(transport: ManagedGmailTransport) {
     effect gmailDrafts(grantId: string, token?: string): { readonly drafts: readonly GmailDraftSummary[]; readonly nextPageToken: string | null }!MailFailure {
       try pageToken(token)
       const value = try decoded(DraftsWire, try call(`${inbox}/drafts?${query({ grantId, pageToken: token })}`))
-      if (value.drafts.length > 50) throw invalid()
+      if (!listedAdmitted(value.drafts.length)) throw invalid()
       const drafts: GmailDraftSummary[] = []
       for (const draft of value.drafts) drafts.push({ ...draft, draftId: try present(draft.draftId), messageId: try present(draft.messageId) })
       return { drafts, nextPageToken: try nextToken(value.nextPageToken, token) }
@@ -231,7 +241,7 @@ export function managedGmailClient(transport: ManagedGmailTransport) {
     effect gmailDraftContent(grantId: string, draftId: string): GmailDraftContent!MailFailure {
       const value = try decoded(DraftWire, try call(`${inbox}/draft?${query({ grantId, draftId })}`))
       const content = value.content
-      if (value.id !== draftId || !sha.test(value.providerDigest) || [content.to, content.cc, content.bcc].some((list) => list.length > 50) ||
+      if (value.id !== draftId || !sha.test(value.providerDigest) || [content.to, content.cc, content.bcc].some((list) => !listedAdmitted(list.length)) ||
         !Number.isSafeInteger(content.attachmentCount) || content.attachmentCount < 0) throw invalid()
       return {
         draftId, messageId: try present(value.messageId), providerDigest: value.providerDigest, to: content.to, cc: content.cc, bcc: content.bcc,

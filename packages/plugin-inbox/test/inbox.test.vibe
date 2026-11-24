@@ -1,8 +1,8 @@
 // spec/inbox/grants.md, "Story: Grant Gmail access one step at a time"; spec/inbox/reads.md, "Story: Read my mailbox without mixing account pages or endlessly reusing a cursor"; spec/inbox/drafts.md, "Story: Keep drafts recoverable across account switches and provider failures"; spec/inbox/readState.md, "Story: Change a message's read state once, and never repeat a change I did not ask for"; spec/inbox/backgroundNotices.md, "Story: Open the Inbox or ask about the exact notification I tapped"; spec/inbox/managedRead.md, "Story: Read my managed inbox fresh, and only for me"; spec/inbox/handoff.md, "Story: Put the agent's words into an email draft without sending it"; spec/inbox/failures.md, "Story: Know what happened when Gmail fails"; spec/inbox/outgoing.md, "Story: Attach files and send exactly the email I reviewed"
 import { assert, it } from "@effect/vitest"
-import type { Memory } from "@elizaos/core"
+import { negotiation } from "@elizaos/agent/device-actions"
 import { managedGmailClient, type ManagedGmailTransport } from "../src/client/index.vibe"
-import { emailDraftAnswer, managedInboxRead } from "../src/index.vibe"
+import { emailDraftAnswer, localComposeCapability, managedInboxRead, managedReadResult, type ComposeTurn } from "../src/index.vibe"
 import {
   AttachmentRefused, MailProtocolFailed, MailUnreachable, checkOutgoingAttachments, classifyGmailFailure, createMailBackground, disconnectGmailAccount,
   encodeInboxUnsaved, gmailActionGrant, gmailConsentCapabilities, gmailGrantChange, gmailReadCacheKey, gmailReadable, inboxOperation,
@@ -57,6 +57,10 @@ function fakeCloud() {
     refuse: undefined as { readonly status: number; readonly error: string } | undefined,
     afterSearch: () => {},
     paths: [] as string[],
+    rowFields: new Map<string, Readonly<Record<string, unknown>>>(),
+    attachmentCap: 8388608,
+    bodyText: new Map<string, string>(),
+    reshape: (answer: Readonly<Record<string, unknown>>): unknown => answer,
   }
 
   const connection = (id: string) => state.connections.find((row) => row.id === id)
@@ -135,14 +139,19 @@ function fakeCloud() {
       if (at === "/gmail/search") {
         const page = state.pages.get(url.searchParams.get("pageToken") ?? "")
         state.afterSearch()
-        return { messages: (page?.messages ?? []).map(wireCard), nextPageToken: page?.next ?? null, syncedAt: "2026-11-20T10:00:00.000Z", mailboxHistoryId: page?.history ?? "41", supportsSpamTrash: true }
+        return state.reshape({ messages: (page?.messages ?? []).map(wireCard), nextPageToken: page?.next ?? null, syncedAt: "2026-11-20T10:00:00.000Z", mailboxHistoryId: page?.history ?? "41", supportsSpamTrash: true })
+      }
+      if (at === "/gmail/inbox-v1/thread") {
+        const threadId = url.searchParams.get("threadId") ?? ""
+        const only = { message: { ...wireCard(card("m1")), threadId }, bodyText: "One", bodyHtml: null, bodyHtmlStatus: "none", attachments: [], authenticationResults: null, historyId: "41" }
+        return state.reshape({ version: 1, threadId, historyId: "41", total: 1, offset: Number(url.searchParams.get("offset") ?? "0"), nextOffset: null, messages: [only] })
       }
       if (at === "/gmail/read") {
         const id = url.searchParams.get("messageId") ?? ""
-        return { message: wireCard(card(id)), bodyText: `Body of ${id}, see https://example.com/a).`, bodyHtml: null, bodyHtmlStatus: "none", attachments: [], authenticationResults: null }
+        return { message: { ...wireCard(card(id)), ...state.rowFields.get(id) }, bodyText: state.bodyText.get(id) ?? `Body of ${id}, see https://example.com/a).`, bodyHtml: null, bodyHtmlStatus: "none", attachments: [], authenticationResults: null }
       }
       if (at === "/gmail/inbox-v1/capabilities") {
-        return { version: 1, from: "ana@example.com", kinds: kindsOf(connection(url.searchParams.get("grantId") ?? "")?.capabilities ?? []), attachmentPolicy: { mimeTypes: ["application/pdf"], maxBytes: 8388608 } }
+        return { version: 1, from: "ana@example.com", kinds: kindsOf(connection(url.searchParams.get("grantId") ?? "")?.capabilities ?? []), attachmentPolicy: { mimeTypes: ["application/pdf"], maxBytes: state.attachmentCap } }
       }
       if (at === "/gmail/inbox-v1/draft") {
         const draftId = url.searchParams.get("draftId") ?? ""
@@ -253,8 +262,31 @@ it.effect(`Page a folder once per message, notice a changed mailbox, and keep ca
   const row = { key: listKey, account: "grant-a", at: now, firstPageRevision: "41", messages: second.messages, query: "in:inbox", cursor: null, cursors: ["p1", "p2"], shifted: true }
   assert.isFalse(try caches.rememberList({ ...row, key: "drafts", query: "in:drafts" }))
   assert.isTrue(try caches.rememberList(row))
+  cloud.state.rowFields.set("m1", { replyTo: "Plans <Plans@Example.org>", hasAttachments: true }).set("m2", { replyTo: "bo@example.com, cy@example.com" })
   const body = try cloud.client.gmailRead("grant-a", "m1")
   assert.deepEqual(body.links, [{ href: "https://example.com/a", text: "https://example.com/a" }])
+  const plain = (try cloud.client.gmailRead("grant-a", "m2")).message
+  cloud.state.bodyText.set("m3", Array.from({ length: 52 }, (_, at) => `https://example.com/${at} https://example.com/${at}`).join(" "))
+  const crowded = try cloud.client.gmailRead("grant-a", "m3")
+  const thread = try cloud.client.gmailThread("grant-a", "t-m1")
+  assert.deepEqual([thread.total, thread.nextOffset, thread.messages.map((row) => row.message.id)], [1, null, ["m1"]])
+  const refusals: string[] = []
+  const searched = () => Effect.asVoid(cloud.client.gmailSearch("grant-a", "in:inbox", 25, "p1"))
+  const threaded = () => Effect.asVoid(cloud.client.gmailThread("grant-a", "t-m1"))
+  const malformed: ReadonlyArray<readonly [Readonly<Record<string, unknown>>, typeof searched]> = [
+    [{ nextPageToken: "p1" }, searched], [{ nextPageToken: "" }, searched], [{ mailboxHistoryId: "4x1" }, searched],
+    [{ messages: Array.from({ length: 26 }, (_, at) => wireCard(card(`x${at}`))) }, searched],
+    [{ nextOffset: 1 }, threaded], [{ total: 2001 }, threaded], [{ offset: 1 }, threaded], [{ historyId: "" }, threaded],
+  ]
+  for (const [fields, read] of malformed) {
+    cloud.state.reshape = (answer) => ({ ...answer, ...fields })
+    const failure = Effect.flip(read()) catch () => new MailUnreachable({ cause: "" })
+    refusals.push(failure._tag === "MailProtocolFailed" ? failure.code : failure._tag)
+  }
+  cloud.state.reshape = (answer) => answer
+  assert.deepEqual(refusals, malformed.map(() => "invalid-response"))
+  assert.deepEqual([crowded.links.length, crowded.links.at(-1)?.href, crowded.omittedLinks, body.omittedLinks], [50, "https://example.com/49", 2, undefined])
+  assert.deepEqual([body.message.replyTo, body.message.hasAttachments, plain.replyTo, plain.hasAttachments], ["plans@example.org", true, undefined, undefined])
   try caches.rememberBody({ key: "m1", account: "grant-a", at: now, body })
   assert.isTrue((try caches.body("m1", now + 1000))?.skipsRead)
   assert.isFalse((try caches.body("m1", now + 600_000))?.skipsRead)
@@ -274,7 +306,8 @@ it.effect(`Page a folder once per message, notice a changed mailbox, and keep ca
   assert.isTrue(try saveMailbox(store, "mailbox", document, 1, () => 1))
   assert.isFalse(try saveMailbox(store, "mailbox", document, 1, () => 2))
   const raw = saved.get("mailbox") ?? ""
-  assert.deepEqual(readSavedMailbox(raw, "ana", null, () => true)?.lists.map((list) => list.key), [listKey])
+  const restored = readSavedMailbox(raw, "ana", null, () => true)
+  assert.deepEqual([restored?.lists.map((list) => list.key), restored?.bodies.map((entry) => entry.body.message.replyTo)], [[listKey], ["plans@example.org"]])
   assert.isNull(readSavedMailbox(raw, "bo", null, () => true))
   assert.deepEqual(readSavedMailbox(raw, "ana", null, (entry) => entry.key !== listKey)?.lists, [])
   assert.isTrue(try clearMailbox(store, "mailbox", 3, () => 3))
@@ -299,6 +332,14 @@ it.effect(`Send a reviewed email once under its owner request, and recover a los
   const connector = cloud.state.connections[0]
   if (connector !== undefined) connector.capabilities = [...modify]
   const caps = try cloud.client.gmailInboxCapabilities("grant-a")
+  assert.deepEqual([caps.send, caps.providerDrafts, caps.forwardAttachments, caps.attachments, caps.attachmentPolicy],
+    [true, true, true, true, { maximumOutgoing: 10, maximumBytes: 8388608, maximumTotalBytes: 8388608, mimeTypes: ["application/pdf"] }])
+  cloud.state.attachmentCap = 0
+  assert.isFalse((try cloud.client.gmailInboxCapabilities("grant-a")).attachments)
+  cloud.state.attachmentCap = 26214401
+  const overCap = Effect.flip(cloud.client.gmailInboxCapabilities("grant-a")) catch () => new MailUnreachable({ cause: "" })
+  assert.equal(overCap._tag === "MailProtocolFailed" && overCap.code, "invalid-response")
+  cloud.state.attachmentCap = 8388608
   const store = memoryStore()
   const deps = { owner: "ana", grantId: "grant-a", active: () => true, capabilities: () => caps, store, client: cloud.client, reviewAttachment: cloud.transport.reviewAttachment }
   const operation = try inboxOperation(deps)
@@ -462,6 +503,13 @@ it.effect(`Read the managed inbox fresh for the current account, and hand a new 
   assert.deepEqual(try managedInboxRead(cloud.client, { limit: 5 }), { kind: "failed", failure: "unavailable" })
   assert.deepEqual(cloud.state.paths.splice(0), readCalls)
 
+  cloud.state.pages.set("", { messages: [{ ...card("m1", "Tom &amp; Jerry"), snippet: "It&#39;s &amp;amp; here\u200b\u200b\u200b now &bogus; &#xD800;" }], next: null, history: "41" })
+  assert.deepEqual(managedReadResult(try managedInboxRead(cloud.client, { limit: 1 })).data?.messages, [{
+    id: "m1", threadId: "t-m1", from: "Bo <bo@example.com>", subject: "Tom & Jerry", snippet: "It's &amp; here now &bogus; \ufffd",
+    receivedAt: "2026-11-20T10:00:00.000Z", unread: true,
+  }])
+  cloud.state.paths.splice(0)
+
   cloud.state.afterSearch = () => {
     personal.connected = false
     work.capabilities = [...readOnly]
@@ -471,11 +519,19 @@ it.effect(`Read the managed inbox fresh for the current account, and hand a new 
 
   const request = {
     id: "5f0c1d2e-3a4b-4c5d-8e9f-a0b1c2d3e4f5", entityId: "6a1b2c3d-4e5f-4a6b-8c7d-e8f9a0b1c2d3", agentId: "7b2c3d4e-5f6a-4b7c-8d9e-f0a1b2c3d4e5",
-    roomId: "8c3d4e5f-6a7b-4c8d-9e0f-a1b2c3d4e5f6", content: { text: "Email Bo about lunch", source: "device" },
-  } as Memory
-  const handed = emailDraftAnswer(request, { parameters: { to: ["bo@example.com"], subject: "Lunch", body: "Noon?" } })
-  assert.deepEqual(handed?.values?.emailDraft, { version: 1, requestMessageId: request.id, to: ["bo@example.com"], subject: "Lunch", body: "Noon?" })
-  assert.equal(emailDraftAnswer(request, { parameters: { to: ["bo@example.com"], body: "Noon?", cc: ["cy@example.com"] } })?.data?.handoff, "inbox")
-  assert.isUndefined(emailDraftAnswer({ ...request, content: { text: "Email Bo", source: "discord" } }, { parameters: { to: ["bo@example.com"], body: "Noon?" } }))
+    roomId: "8c3d4e5f-6a7b-4c8d-9e0f-a1b2c3d4e5f6", content: { text: "Email Bo about lunch" },
+  } as ComposeTurn["message"]
+  assert.equal(negotiation(true, `calendar.create.v1, ${localComposeCapability}`).tag, "Negotiated")
+  const phone: ComposeTurn = { capabilities: ["calendar.create.v1", localComposeCapability], message: request }
+  const lunch = { parameters: { to: ["bo@example.com"], subject: "Lunch", body: "Noon?" } }
+  const handed = emailDraftAnswer(phone, lunch)
+  assert.deepEqual([handed?.turnComplete, handed?.data], [true, { actionName: "INBOX_COMPOSE_EMAIL", version: 1, requestMessageId: request.id, to: ["bo@example.com"], subject: "Lunch", body: "Noon?" }])
+  assert.equal(emailDraftAnswer(phone, { parameters: { to: ["bo@example.com"], body: "Noon?", cc: ["cy@example.com"] } })?.data?.handoff, "inbox")
+  assert.isUndefined(emailDraftAnswer({ ...phone, capabilities: ["calendar.create.v1"] }, lunch))
+  assert.deepEqual(emailDraftAnswer(phone, { parameters: { to: ["Me", " Sam Lee ", "", "bo@example.com"], body: "Milk" } })?.data?.to, ["self", "Sam Lee", "bo@example.com"])
+  assert.equal(emailDraftAnswer(phone, { parameters: { to: [" "], subject: "List", body: "Milk" } })?.data?.handoff, "incomplete")
+  assert.equal(emailDraftAnswer(phone, { parameters: { to: Array.from({ length: 21 }, (_, at) => `p${at}@example.com`), body: "Milk" } })?.data?.handoff, "inbox")
+  assert.equal(emailDraftAnswer(phone, { parameters: { to: "myself", subject: "Two\nlines", body: "Milk" } })?.data?.handoff, "inbox")
+  assert.isUndefined(emailDraftAnswer(undefined, lunch))
   assert.equal(cloud.state.dispatches, 0)
 })

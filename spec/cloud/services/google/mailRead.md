@@ -108,6 +108,26 @@ pure def lawAScoreIsWithinItsRange(signals: TriageSignals): bool =
   triageScore(signals) >= 0 and triageScore(signals) <= 110 and (triageReasons(signals) == List() implies triageScore(signals) == 0)
 ```
 
+### A message row names the one address its replies go to, and hints at attachments
+
+Every message row, in triage, a search page, a message read and a thread
+page, carries `replyTo`: the single literal address its `Reply-To` header
+names, or null when the message has no such header or the header names
+anything else. [The reviewed operations](./mailOperations.md) bind a reply
+to that header, so a client can address the reply where the review will
+accept it. It also carries `hasAttachments`: true when the message's outer
+part is a `multipart/mixed` container, which is all a header read learns,
+or is itself a named file. That is a hint for a list row, never an
+inventory; a message read lists the attachments themselves.
+
+```quint
+pure def replyAddressNamed(headerPresent: bool, oneLiteralAddress: bool): bool = headerPresent and oneLiteralAddress
+pure def attachmentHint(mixedContainer: bool, namedFile: bool): bool = mixedContainer or namedFile
+pure def lawAPlainMessageHintsAtNoAttachment(namedFile: bool): bool = attachmentHint(false, namedFile) == namedFile
+pure def lawNoReplyHeaderNamesNoAddress(oneLiteralAddress: bool): bool = not(replyAddressNamed(false, oneLiteralAddress))
+pure def lawOnlyALiteralAddressIsNamed(headerPresent: bool): bool = not(replyAddressNamed(headerPresent, false))
+```
+
 ### A search page names the mailbox revision read before it was listed and never continues at the token it was asked with
 
 The query is non-blank and a page token is 1 to 4,096 characters. The shell
@@ -136,7 +156,7 @@ pure def lawASearchPageNeverLoops(asked: Continuation, answered: Continuation, m
 
 `read(messageId)` answers the triage row of the message, `bodyText` (the
 plain part, else the HTML part as text, else the snippet), `bodyHtml` and
-`bodyHtmlStatus` (`available`, `none`, `too_large`), its links, its
+`bodyHtmlStatus` (`available`, `none`, `too_large`), its
 attachment descriptors and `authenticationResults`: the Authentication-Results
 header Google's receiving server wrote, or null when the read cannot tell it
 from one a sender wrote. That header is the first one, it names
