@@ -29,6 +29,7 @@ export interface CloudSpeechStarted {
   readonly sessionId: SpeechSessionId;
   readonly sampleRate: number;
   readonly echoCancelled: boolean;
+  readonly muted?: boolean;
 }
 
 export interface CloudStreamPort {

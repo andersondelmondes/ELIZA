@@ -49,9 +49,14 @@ public final class LiveVoiceCapture implements LiveCaptureController.Capture {
  public static final String CONVERSATION="live-voice",DICTATION="dictation";
  private static final int EMIT_WINDOWS=3; // about 96 ms per sink event
 
- /** Silero VAD is usable in this process: the bridge loads, VAD is compiled in and the bundle has its model. */
+ /** Silero VAD is usable in this process: cached on the session without tearing down native VAD on repeated probes. */
  public static boolean vadAvailable(InferenceSession inference){
-  try{InferenceSession.Vad vad=inference.openVad();vad.close();return true;}catch(Exception|Error unavailable){return false;}
+  try{return inference!=null&&inference.vadAvailable();}catch(Exception|Error unavailable){return false;}
+ }
+
+ /** Prewarms a standby Silero VAD detector on {@code inference} so the next live capture starts immediately. */
+ public static boolean prewarmVad(InferenceSession inference){
+  try{return inference!=null&&inference.prewarmVad();}catch(Exception|Error unavailable){return false;}
  }
 
  /**

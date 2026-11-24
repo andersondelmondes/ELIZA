@@ -1,9 +1,13 @@
 // spec/cloud/services/speechRelay.md, "Story: Start speech only from a consent I gave"; spec/cloud/services/speechRelay.md, "Story: Keep a live session funded and close it with receipts"
 import { describe, expect, it } from "vitest";
-import { Effect } from "effect";
+import { ConfigProvider, Effect, Layer } from "effect";
+import { FetchHttpClient } from "effect/http";
 import { driver } from "./drivers/cloud__services__speechRelay.ts";
-import { openSocket, reapSessions, retire, sessionEnding } from "../src/services/speech-session.vibe";
+import { addCredits } from "../src/billing/funds.vibe";
+import { deploymentLayer, parseProfile } from "../src/profile/profile.vibe";
+import { admitWindow, openSocket, reapSessions, relaySession, retire, sessionEnding } from "../src/services/speech-session.vibe";
 import { ledger, within } from "./support/ledger.ts";
+import { secrets, testProfile } from "./support/profile.ts";
 import { loadRow, stepRow } from "../src/store/rows.vibe";
 import type { Session } from "../gen/cloud__services__speechRelay.ts";
 import { sessionColumns, sessionRows } from "../src/services/speech-session.vibe";
@@ -36,10 +40,21 @@ describe("Speech session (spec/cloud/services/speechRelay.md, \"Story: Start spe
       const minted = await cloud.run(within((tx) => stepRow(tx, sessionRows, key, { type: "mint", tokenDigest: "d", expiresAt: 60_000, credentialExpiresAt: 10 ** 13, now: 0, consentConsumed: true }, (s: Session) => ({ ...sessionColumns(0)(s), consent_nonce: `n-${key}`, user_id: "u", organization_id: "org-x", credential_kind: "session", credential_ref: "cred", credential_expires_at: 10 ** 13, created_at: 0 }))));
       expect(minted.kind).toBe("done");
     }
+    const profile = await Effect.runPromise(parseProfile(testProfile("http://fake.invalid")));
+    const deploy = Layer.mergeAll(deploymentLayer(profile, "staging"), FetchHttpClient.layer).pipe(Layer.provide(ConfigProvider.layer(ConfigProvider.fromEnvRecord({ ...secrets }))));
+    expect((await cloud.run(addCredits({ organizationId: "org-x", amount: 1_000_000, requestKey: "fund-org-x" }))).kind).toBe("done");
     cloud.at(10);
     expect((await cloud.run(openSocket("a"))).kind).toBe("done");
     const second = await cloud.run(openSocket("a"));
     expect(second.kind === "failed" && (second.error as { refusal: { code: string } }).refusal.code).toBe("SessionClosed");
+    const admitted = await cloud.run(Effect.provide(admitWindow("a", 1), deploy));
+    expect(admitted.kind === "done" && admitted.value.kind === "admitted").toBe(true);
+    const dispatched = await cloud.run(Effect.provide(relaySession.dispatchWindow("a", 1), deploy));
+    expect(dispatched.kind).toBe("done");
+    const holdPhases = await cloud.sql("SELECT phase FROM holds ORDER BY key");
+    expect(holdPhases.map((r) => r.phase)).toEqual(["dispatched", "dispatched"]);
+    const settled = await cloud.run(Effect.provide(relaySession.settleWindow("a", 1, { pcmBytes: 0, ttsChars: 0, sttDrained: true, ttsConfirmed: true, dispatched: true }), deploy));
+    expect(settled.kind).toBe("done");
     const waiting = cloud.run(sessionEnding("a"));
     await Effect.runPromise(Effect.sleep(50));
     const retired = await cloud.run(retire("a", "Revoked"));

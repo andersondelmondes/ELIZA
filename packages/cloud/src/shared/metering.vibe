@@ -169,8 +169,7 @@ export effect function reserve(owner: HoldOwner, key: HoldKey, quote: number): H
   return try store.transaction((tx) => reserveIn(tx, owner, key, quote, now))
 }
 
-effect function holdRow(tx: Tx, key: string): HoldRow!(StoreFailure | HoldUnknown) {
-  try tx.query("SELECT o.id FROM organizations o JOIN holds h ON o.id = h.organization_id WHERE h.key = $1 FOR UPDATE OF o", [key])
+effect function holdRowOnly(tx: Tx, key: string): HoldRow!(StoreFailure | HoldUnknown) {
   const row = (try tx.query("SELECT organization_id, user_id, service, allowance_period, created_at FROM holds WHERE key = $1 FOR UPDATE", [key]))[0]
   if (row === undefined) throw new HoldUnknown({ key })
   return {
@@ -182,13 +181,20 @@ effect function holdRow(tx: Tx, key: string): HoldRow!(StoreFailure | HoldUnknow
   }
 }
 
+effect function holdRow(tx: Tx, key: string): HoldRow!(StoreFailure | HoldUnknown) {
+  try tx.query("SELECT o.id FROM organizations o JOIN holds h ON o.id = h.organization_id WHERE h.key = $1 FOR UPDATE OF o", [key])
+  return try holdRowOnly(tx, key)
+}
+
+export effect function markDispatchedIn(tx: Tx, key: string, now: number): Hold!MeteringFailure {
+  const row = try holdRowOnly(tx, key)
+  return (try stepRow(tx, holdRows, key, { type: "markDispatched", now }, columns(row, now))).state
+}
+
 export effect function markDispatched(key: string): Hold!MeteringFailure!Store {
   const store = try Store
   const now = try Clock.currentTimeMillis
-  return try store.transaction(effect (tx: Tx) => {
-    const row = try holdRow(tx, key)
-    return (try stepRow(tx, holdRows, key, { type: "markDispatched", now }, columns(row, now))).state
-  })
+  return try store.transaction((tx) => markDispatchedIn(tx, key, now))
 }
 
 export type Settlement =

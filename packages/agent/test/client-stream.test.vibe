@@ -54,6 +54,12 @@ module node {
     validate: async () => true, handler: async () => ({ success: true, text: "Shown." }),
   }
 
+  const reviewAction: Action = {
+    name: "REVIEW_PROPOSAL", description: "Creates a pending review proposal.", contexts: ["general"],
+    validate: async () => true,
+    handler: async () => ({ success: true, text: "Ready to review on your phone.", data: { actionName: "REVIEW_PROPOSAL", approvalRequired: true, awaitingUserInput: true } }),
+  }
+
   export const agendaApp: AgentPlugin = {
     name: "agenda-app", description: "An app that reads the owner's agenda and shows it or the journal",
     init: async (_config, runtime) => {
@@ -67,7 +73,7 @@ module node {
         })
       }
     },
-    actions: [agendaRead, agendaFind, plannerShow],
+    actions: [agendaRead, agendaFind, plannerShow, reviewAction],
   }
 
   export const privateEffectPayload = "private-fixture-effect-payload"
@@ -282,15 +288,45 @@ describe('Frames the agent never writes (spec/agent/conversation/replyStream.md,
     }))
   })
 
-  it.live('A frame type the reader does not know is skipped, a tool frame without a label is read, and an unknown field on a known frame still fails (spec/agent/conversation/replyStream.md, "Story: See a reply as it is written")', effect () => {
-    const done = `{"type":"done","fullText":"Sent.","messageId":"m","userMessageId":"u","agentName":"agent","actionResults":[]}`
+  it.live('A frame type the reader does not know is skipped, a tool frame without a label is read, awaitingReview is decoded on done, and an unknown field on a known frame still fails (spec/agent/conversation/replyStream.md, "Story: See a reply as it is written")', effect () => {
+    const done = `{"type":"done","fullText":"Sent.","messageId":"m","userMessageId":"u","agentName":"agent","actionResults":[],"awaitingReview":true}`
     const later = try read(frames(`{"type":"tool","name":"CALCULATE"}`, `{"type":"heard","at":3}`, `{"type":"acknowledgment","text":"Sure."}`, done), 5)
     const extraField = try read(frames(`{"type":"tool","name":"CALCULATE","label":"Working","app":"x"}`, done), 5)
-    try Effect.try(() => assert.deepStrictEqual({ later: [later.outcome.kind, later.seen], extraField: extraField.outcome }, {
-      later: ["Done", ["tool:CALCULATE:undefined", "acknowledgment:Sure."]],
+    try Effect.try(() => assert.deepStrictEqual({
+      later: [later.outcome.kind, later.outcome.kind === "Done" ? later.outcome.awaitingReview : undefined, later.seen],
+      extraField: extraField.outcome,
+    }, {
+      later: ["Done", true, ["tool:CALCULATE:undefined", "acknowledgment:Sure."]],
       extraField: { kind: "Failed", code: REPLY_STREAM_PROTOCOL, message: "A reply stream frame does not match the reply protocol" },
     }))
   })
+
+  it.live('A turn with a review-required action emits awaitingReview on done while normal actions omit it (spec/agent/conversation/replyStream.md, "Every stream that is not dropped ends with exactly one done or error frame, after which nothing is written")', effect () => {
+    const cloud = try cloudFake(deviceKey)
+    const agent = try startInProcess({
+      launch: {
+        backend: { kind: "cloud", origin: cloud.origin }, load: [agendaApp.name],
+        allowed: ["REPLY", "IGNORE", "NONE", "PLANNER_SHOW", "REVIEW_PROPOSAL"],
+      },
+      frame: { credential: { version: 1, value: deviceKey } }, bundled: new Map([[agendaApp.name, agendaApp]]),
+    })
+    const { id } = try conversation(agent)
+    try Effect.sync(() => cloud.script(
+      toolCalls("", { name: "REVIEW_PROPOSAL", arguments: {} }),
+      text("Ready to review on your phone."),
+      toolCalls("", { name: "PLANNER_SHOW", arguments: {} }),
+      text("Shown."),
+    ))
+    const reviewStream = try read(try streamed(agent, id, { text: "Propose a reviewable action." }), 7)
+    const normalStream = try read(try streamed(agent, id, { text: "Show something normal." }), 7)
+    try Effect.try(() => assert.deepStrictEqual({
+      review: reviewStream.outcome.kind === "Done" ? reviewStream.outcome.awaitingReview : undefined,
+      normal: normalStream.outcome.kind === "Done" ? normalStream.outcome.awaitingReview : undefined,
+    }, {
+      review: true,
+      normal: undefined,
+    }))
+  }, 120_000)
 
   it.live('An error frame ends the read before EOF (spec/agent/conversation/replyStream.md, "Every stream that is not dropped ends with exactly one done or error frame, after which nothing is written")', effect () => {
     const result = try host("terminal error before EOF", () => readErrorBeforeEof())

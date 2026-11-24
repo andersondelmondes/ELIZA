@@ -83,6 +83,11 @@ export interface TtsLink {
   readonly edges: Stream.Stream<TtsEdge, SpeechFailure>
 }
 
+export interface RealtimeLinks {
+  readonly stt: SttLink
+  readonly tts: TtsLink
+}
+
 const synthesisBudget: Millis = 30_000
 const transcriptionBudget: Millis = 120_000
 export const realtimeOpenBudget: Millis = 8_000
@@ -400,4 +405,9 @@ export effect function openTts(): TtsLink!SpeechFailure!(Deployment | Scope.Scop
     cancel: (id: string) => link.write(JSON.stringify({ context_id: id, cancel: true })),
     edges: link.edges
   }
+}
+
+export effect function openRealtimeLinks(): RealtimeLinks!SpeechFailure!(Deployment | Scope.Scope) {
+  const [stt, tts] = try Effect.all([openStt(), openTts()], { concurrency: 2 })
+  return { stt, tts }
 }

@@ -134,7 +134,7 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
   private static final long HTTP_STARTUP_MS = 12_000, RELAY_STARTUP_MS = 8_000, PROGRESS_MS = 100, JOIN_MS = 1500, SILENCE_MS = 32;
   private static final long LEVEL_NS = 50_000_000L, FEED_BYTES = 8 * 1024 * 1024;
   private static final int FEED_TASKS = 1024, MAX_BODY = 32768, MAX_REFUSAL = 16384, MIC_FRAME = 1024, SILENCE_FRAMES = 30;
-  private static final int MAX_QUEUE = 64000, TIMINGS = 100, PLAYBACK_CAPACITY = RATE * 5, CHUNK = 1600;
+  private static final int MAX_QUEUE = 64000, PRE_READY_MAX_BYTES = 48 * MIC_FRAME, TIMINGS = 100, PLAYBACK_CAPACITY = RATE * 5, CHUNK = 1600;
   private static final float AUDIBLE = 0.005f;
   private static final String AUDIO_FOCUS_LOST = "audio-focus-lost";
 
@@ -280,6 +280,9 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
     }
     mark(own, "start");
     own.scheduleStartupDeadline();
+    if (!own.muted && microphoneGranted()) {
+      submit(media, () -> preopenMicrophone(own), () -> {});
+    }
     submit(control, () -> open(own), () -> refuse(own, "closed", null));
   }
 
@@ -584,7 +587,9 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
   /** Main thread. A repeated mute sends another silence tail without reopening the microphone. */
   private void mute(Session own, PluginCall call) {
     own.muted = true;
-    if (apply(own, new Event.Mute(), null) == null && own.captured && !own.closed.get()) silence(own, own.muteGeneration.incrementAndGet(), SILENCE_FRAMES);
+    Step step = apply(own, new Event.Mute(), null);
+    if (step == null && own.captured && !own.closed.get()) silence(own, own.muteGeneration.incrementAndGet(), SILENCE_FRAMES);
+    if (step == null && own.microphone != null) releaseMicrophone(own, false);
     releaseListening(own);
     if (call != null) submit(media, call::resolve, () -> call.reject("Voice is closed"));
   }
@@ -968,18 +973,13 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
     }
   }
 
-  /** Media thread: reserves the microphone slot as live capture, opens it, and reports the answer. */
-  private void openMicrophone(Session own) {
-    if (own.closed.get() || own.machine.state().capture() != CloudSpeechPolicy.Capture.RESERVING) {
-      settleUnmutes(own, settledAway(own));
-      return;
-    }
+  /** Media thread: opens AudioRecord into a bounded local pre-ready buffer in parallel with cloud startup. */
+  private void preopenMicrophone(Session own) {
+    if (own.closed.get() || own.muted || !valid(own) || focus.callActive() || own.microphone != null) return;
     LocalMicrophoneLease lease;
     try {
       lease = LocalMicrophoneLease.PROCESS.reserve(LocalMicrophoneLease.User.LIVE_CAPTURE, false, () -> main.post(() -> draftRequested(own)));
     } catch (LocalMicrophoneLease.Refused refused) {
-      SlotAnswer answer = refused.refusal == LocalMicrophoneLease.Refusal.FENCED_REOPEN ? SlotAnswer.FENCED_REOPEN : SlotAnswer.SLOT_BUSY;
-      apply(own, new Event.CaptureAnswered(answer), Why.code("capture"));
       return;
     }
     Microphone microphone = new Microphone(own, lease);
@@ -987,10 +987,43 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
       microphone.open();
     } catch (Exception | Error unavailable) {
       microphone.close();
-      apply(own, new Event.CaptureAnswered(SlotAnswer.SLOT_BUSY), Why.code("capture"));
+      return;
+    }
+    if (own.closed.get() || own.muted || !valid(own)) {
+      microphone.close();
       return;
     }
     own.microphone = microphone;
+    microphone.prebuffer();
+  }
+
+  /** Media thread: reserves the microphone slot as live capture (or attaches the pre-opened one) and reports the answer. */
+  private void openMicrophone(Session own) {
+    if (own.closed.get() || own.machine.state().capture() != CloudSpeechPolicy.Capture.RESERVING) {
+      settleUnmutes(own, settledAway(own));
+      return;
+    }
+    Microphone microphone = own.microphone;
+    boolean preopened = microphone != null && !microphone.closed && !microphone.stopping;
+    if (!preopened) {
+      LocalMicrophoneLease lease;
+      try {
+        lease = LocalMicrophoneLease.PROCESS.reserve(LocalMicrophoneLease.User.LIVE_CAPTURE, false, () -> main.post(() -> draftRequested(own)));
+      } catch (LocalMicrophoneLease.Refused refused) {
+        SlotAnswer answer = refused.refusal == LocalMicrophoneLease.Refusal.FENCED_REOPEN ? SlotAnswer.FENCED_REOPEN : SlotAnswer.SLOT_BUSY;
+        apply(own, new Event.CaptureAnswered(answer), Why.code("capture"));
+        return;
+      }
+      microphone = new Microphone(own, lease);
+      try {
+        microphone.open();
+      } catch (Exception | Error unavailable) {
+        microphone.close();
+        apply(own, new Event.CaptureAnswered(SlotAnswer.SLOT_BUSY), Why.code("capture"));
+        return;
+      }
+      own.microphone = microphone;
+    }
     Step step = apply(own, new Event.CaptureAnswered(SlotAnswer.NO_REFUSAL), null);
     if (step == null || CloudSpeechPolicy.ended(step.state())) {
       if (own.microphone == microphone) own.microphone = null;
@@ -999,7 +1032,14 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
       return;
     }
     own.captured = true;
-    microphone.listen(step.state().generation());
+    if (preopened) {
+      if (!microphone.attachLive(step.state().generation())) {
+        main.post(() -> deviceEnded(own, DeviceCause.MICROPHONE_LOST, "capture"));
+        return;
+      }
+    } else {
+      microphone.listen(step.state().generation());
+    }
     settleStart(own, microphone.echoEnabled);
     settleUnmutes(own, true);
   }
@@ -1043,9 +1083,12 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
   private final class Microphone {
     final Session own;
     final LocalMicrophoneLease lease;
+    final Object streamLock = new Object();
+    final PreReadyPcmBuffer preReady = new PreReadyPcmBuffer(PRE_READY_MAX_BYTES);
     AudioRecord recorder;
     AcousticEchoCanceler echo;
     Thread reader;
+    int liveGeneration;
     boolean echoEnabled, closed;
     volatile boolean stopping;
 
@@ -1075,8 +1118,39 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
       if (!lease.opened()) throw new IOException("Microphone slot was reclaimed");
     }
 
+    /** Captures PCM into the bounded local pre-ready buffer until {@link #attachLive} flushes it. */
+    synchronized void prebuffer() {
+      startReader(0);
+    }
+
+    /** Flushes pre-ready PCM in FIFO order and switches the running reader seamlessly to {@code generation}. */
+    boolean attachLive(int generation) {
+      synchronized (streamLock) {
+        if (closed || stopping) return false;
+        List<byte[]> pending = preReady.drain();
+        boolean ok = true;
+        for (byte[] chunk : pending) {
+          try {
+            if (ok && !own.sendPcm(chunk, chunk.length)) ok = false;
+          } finally {
+            Arrays.fill(chunk, (byte) 0);
+          }
+        }
+        if (!ok) return false;
+        liveGeneration = generation;
+        return true;
+      }
+    }
+
     /** Streams PCM only while the machine says capture {@code generation} listens; levels always. */
     synchronized void listen(int generation) {
+      startReader(generation);
+    }
+
+    private void startReader(int initialGeneration) {
+      synchronized (streamLock) {
+        liveGeneration = initialGeneration;
+      }
       AudioRecord source = recorder;
       reader = new Thread(() -> {
         byte[] frame = new byte[MIC_FRAME];
@@ -1090,14 +1164,23 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
               main.post(() -> invalidate(own));
               break;
             }
-            State s = own.machine.state();
-            boolean listening = s.capture() == CloudSpeechPolicy.Capture.LISTENING && s.generation() == generation;
+            boolean emitPeak;
+            synchronized (streamLock) {
+              if (liveGeneration == 0) {
+                preReady.offer(frame, count);
+                emitPeak = true;
+              } else {
+                State s = own.machine.state();
+                boolean listening = s.capture() == CloudSpeechPolicy.Capture.LISTENING && s.generation() == liveGeneration;
+                emitPeak = listening;
+                if (listening && !own.sendPcm(frame, count)) throw new IOException("Speech upload stalled");
+              }
+            }
             long now = System.nanoTime();
             if (now - levelAt > LEVEL_NS) {
               levelAt = now;
-              emit(own, "level", new JSObject().put("peak", listening ? CloudSpeechWire.peak(frame, count) : 0));
+              emit(own, "level", new JSObject().put("peak", emitPeak ? CloudSpeechWire.peak(frame, count) : 0));
             }
-            if (listening && !own.sendPcm(frame, count)) throw new IOException("Speech upload stalled");
           }
         } catch (Exception failure) {
           if (!stopping && !own.closed.get()) main.post(() -> deviceEnded(own, DeviceCause.MICROPHONE_LOST, "capture"));
@@ -1131,6 +1214,9 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
           Thread.currentThread().interrupt();
         }
         confirmed = !active.isAlive();
+      }
+      synchronized (streamLock) {
+        preReady.clear();
       }
       if (echo != null) {
         try {

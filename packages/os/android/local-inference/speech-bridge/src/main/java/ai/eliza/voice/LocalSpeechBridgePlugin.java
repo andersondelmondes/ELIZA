@@ -28,6 +28,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -149,6 +150,8 @@ public abstract class LocalSpeechBridgePlugin extends Plugin {
  public interface ResidentRoute { LiveSegmentPipe.Transport open()throws Exception; }
  /** True when {@link #residentRoute} carries segments natively (reported by liveCaptureStatus). */
  protected boolean residentTransport(){return false;}
+ /** Optional product hook run in the background by {@link #prewarmLiveCapture()} to warm resident ASR. */
+ protected void prewarmResidentRoute()throws Exception{}
  /**
   * Runs a request that launches through the activity (a permission prompt). Capacitor can deliver
   * a call after the activity is gone, when the launcher throws IllegalStateException: the call is
@@ -659,7 +662,20 @@ public abstract class LocalSpeechBridgePlugin extends Plugin {
   public void frames(String id,JSONArray frames,JSONArray vad,float peak){notifyListeners("liveCaptureFrames",new JSObject().put("captureId",id).put("frames",frames).put("vad",vad).put("peak",peak));}
   public void ended(String id,String error){JSObject event=new JSObject().put("captureId",id);if(error!=null)event.put("error",error);notifyListeners("liveCaptureEnded",event);}
   public void transcript(String id,JSONObject value,String error){JSObject event=new JSObject().put("captureId",id);if(error!=null)event.put("error",error);else event.put("final",value);notifyListeners("liveCaptureTranscript",event);}
+  public void prewarm()throws Exception{
+   if(destroyed)return;
+   if(VoiceBundleAssets.isPackaged(getContext()))LiveVoiceCapture.prewarmVad(VoiceAssets.sharedInference(getContext()));
+   prewarmResidentRoute();
+  }
  });
+ /** Warms bundled VAD and any product resident route in the background so live capture starts immediately. */
+ protected final CompletableFuture<Boolean> prewarmLiveCapture(){
+  if(destroyed)return CompletableFuture.completedFuture(false);
+  return live.prewarm();
+ }
+ @PluginMethod public void prewarmLiveCapture(PluginCall call){
+  prewarmLiveCapture().whenComplete((ready,error)->call.resolve(new JSObject().put("warmed",Boolean.TRUE.equals(ready)&&error==null)));
+ }
  private final Map<String,LiveCaptureAdmission.Ticket> livePermissionEpochs=new ConcurrentHashMap<>();
  @PluginMethod public void liveCaptureStatus(PluginCall call){
   boolean permitted=getPermissionState("microphone")==PermissionState.GRANTED;

@@ -44,6 +44,7 @@ module node {
     readonly cutOffEffect?: "applied"
     readonly taskChoices?: readonly TaskChoiceWidget[]
     readonly action?: VoiceAction
+    readonly awaitingReview?: boolean
   }
 
   interface Failure {
@@ -321,6 +322,29 @@ module node {
     })
   }
 
+  function awaitsReview(results: readonly ActionResult[]): boolean {
+    return results.some(({ data }) => typeof data === "object" && data !== null
+      && (data.approvalRequired === true || data.awaitingReview === true))
+  }
+
+  function failureFields(failure: Failure): Pick<TurnReply, "failureKind" | "planAction" | "retryAfterMs" | "cutOffEffect"> {
+    const kind = replyKind(failure)
+    const planAction = planActionOf(kind)
+    const wait = providerWaitMs(kind, Date.now())
+    return {
+      failureKind: failure.kind,
+      ...(planAction === "sign-in" || planAction === "funding" || planAction === "retry" ? { planAction } : {}),
+      ...(wait < 0 ? {} : { retryAfterMs: wait }),
+      ...(failure.cutOffEffect === undefined ? {} : { cutOffEffect: failure.cutOffEffect }),
+    }
+  }
+
+  function replyForRequest(body: SendAnswer["body"], headers: ReadonlyMap<string, string>): SendAnswer["body"] {
+    if ("error" in body || body.cutOffEffect === undefined || publishesCutOffEffect(true, headers.get("x-eliza-device-cut-off-effect") === "applied")) return body
+    const { cutOffEffect: _cutOffEffect, ...reply } = body
+    return reply
+  }
+
   export function conversationRoutes(runtime: AgentRuntime, owner: ConversationOwner, agentName: string, publish: (payload: unknown) => void, device?: DeviceTurnPort): LocalRoute[] {
     if (!runtime.messageService) throw new Error("A conversation requires the message service")
     const rooms = () => runtime.getRooms(owner.world)
@@ -330,25 +354,10 @@ module node {
     const live = new Map<UUID, RunningSend>()
     const stopping = new Map<UUID, Promise<ReturnType<typeof okay>>>()
     const boot = randomUUID()
-    const failureFields = (failure: Failure): Pick<TurnReply, "failureKind" | "planAction" | "retryAfterMs" | "cutOffEffect"> => {
-      const kind = replyKind(failure)
-      const planAction = planActionOf(kind)
-      const wait = providerWaitMs(kind, Date.now())
-      return {
-        failureKind: failure.kind,
-        ...(planAction === "sign-in" || planAction === "funding" || planAction === "retry" ? { planAction } : {}),
-        ...(wait < 0 ? {} : { retryAfterMs: wait }),
-        ...(failure.cutOffEffect === undefined ? {} : { cutOffEffect: failure.cutOffEffect }),
-      }
-    }
-    const answer = (text: string, messageId: UUID, userMessageId: UUID, failure?: Failure, taskChoices?: readonly TaskChoiceWidget[], actionResults: TurnReply["actionResults"] = [], action?: VoiceAction) =>
+    const answer = (text: string, messageId: UUID, userMessageId: UUID, failure?: Failure, taskChoices?: readonly TaskChoiceWidget[], actionResults: TurnReply["actionResults"] = [], action?: VoiceAction, awaitingReview?: boolean) =>
       okay({ fullText: text, text, agentName, messageId, userMessageId, actionResults, ...(action === undefined ? {} : { action }),
+        ...(awaitingReview === true ? { awaitingReview: true } : {}),
         ...(failure === undefined ? {} : failureFields(failure)), ...(taskChoices === undefined ? {} : { taskChoices }) } satisfies TurnReply)
-    const replyForRequest = (body: SendAnswer["body"], headers: ReadonlyMap<string, string>): SendAnswer["body"] => {
-      if ("error" in body || body.cutOffEffect === undefined || publishesCutOffEffect(true, headers.get("x-eliza-device-cut-off-effect") === "applied")) return body
-      const { cutOffEffect: _cutOffEffect, ...reply } = body
-      return reply
-    }
 
     async function send(
       room: Room, parsed: Extract<ParsedTurn, { kind: "input" }>, signal: AbortSignal, headers: ReadonlyMap<string, string>, stream?: StreamDelivery,
@@ -453,7 +462,8 @@ module node {
         if (shown?.kind === "Refused") return failure(shown.status, shown.error)
         const ran = turnActions(result.actionResults ?? [])
         return answer(result.responseContent.text, reply.id, result.userMessageId, undefined, shown?.choices, ran,
-          voiceActionLabel(channelType === ChannelType.VOICE_DM, text, result.responseContent.text, ran.map(({ action }) => action)))
+          voiceActionLabel(channelType === ChannelType.VOICE_DM, text, result.responseContent.text, ran.map(({ action }) => action)),
+          awaitsReview(result.actionResults ?? []))
       }
 
       if (busy) return sendOwned(signal)
@@ -560,12 +570,13 @@ module node {
           attached.resolve({ writer, signal: left })
           const body = replyForRequest((await result).body, headers)
           if ("error" in body) return { type: "error", code: body.error, message: "The turn did not complete" }
-          const { fullText, messageId, userMessageId, agentName, actionResults, failureKind, planAction, retryAfterMs, cutOffEffect, taskChoices, action } = body
+          const { fullText, messageId, userMessageId, agentName, actionResults, failureKind, planAction, retryAfterMs, cutOffEffect, taskChoices, action, awaitingReview } = body
           return {
             type: "done", fullText, messageId, userMessageId, agentName, actionResults, kind: replyKind(failureKind === undefined ? undefined : { kind: failureKind }),
             ...(planAction === undefined ? {} : { planAction }), ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
             ...(cutOffEffect === undefined ? {} : { cutOffEffect }),
             ...(taskChoices === undefined ? {} : { taskChoices }), ...(action === undefined ? {} : { action }),
+            ...(awaitingReview === true ? { awaitingReview: true } : {}),
           }
         } }
       }),

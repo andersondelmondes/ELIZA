@@ -24,6 +24,7 @@ export schema DoneFrame {
   readonly retryAfterMs?: ProviderWait
   readonly cutOffEffect?: "applied"
   readonly action?: VoiceActionLabel
+  readonly awaitingReview?: boolean
 }
 export schema ErrorFrame { readonly type: "error"; readonly code: Schema.NonEmptyString; readonly message: string }
 export schema ReplyFrame = SnapshotFrame | AppendFrame | ReplaceFrame | AcknowledgmentFrame | StatusFrame | ToolFrame | ReadyFrame | DoneFrame | ErrorFrame

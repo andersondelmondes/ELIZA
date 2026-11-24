@@ -1,6 +1,6 @@
 // spec/cloud/services/speechRelay.md, "Story: Speak the relay protocol on one socket"; spec/cloud/index.md, "Story: Transcribe a recording"
 import { assert, describe, it } from "@effect/vitest"
-import { openStt, openTts, prepareTranscription, synthesize, synthesizeTimed } from "../src/providers/speech.vibe"
+import { openRealtimeLinks, openStt, prepareTranscription, synthesize, synthesizeTimed } from "../src/providers/speech.vibe"
 import { FetchHttpClient } from "effect/http"
 import { Deployment, deploymentLayer, parseProfile } from "../src/profile/profile.vibe"
 import { startFakeServer } from "./support/fakes.ts"
@@ -32,14 +32,14 @@ describe("WP6 Speech provider (spec/cloud/services/speechRelay.md)", () => {
       const refused = try failureTag(synthesize(settings, synthesis))
       const outage = try failureTag(synthesize(settings, synthesis))
       const garbled = try failureTag(Effect.flatten(prepareTranscription(settings, { audio: new Uint8Array([1, 2]), mimeType: "audio/wav" })))
-      const stt = try openStt()
+      const { stt, tts } = try openRealtimeLinks()
       try stt.send(new Uint8Array(640))
       const edges = Array.from(try Stream.runCollect(Stream.take(stt.edges, 4)))
       const drained = try stt.drain()
-      const tts = try openTts()
       try tts.speak("u1", "Hi", true)
       try tts.finish("u1")
       const spoken = Array.from(try Stream.runCollect(Stream.take(tts.edges, 3)))
+      try tts.cancel("u2")
       try sync(() => fake.scriptRealtime({ kind: "refuse", status: 401 }))
       const badOpen = try failureTag(openStt())
       return {
@@ -56,7 +56,7 @@ describe("WP6 Speech provider (spec/cloud/services/speechRelay.md)", () => {
       {
         result,
         transcribed: fake.transcribed.map((each) => [each.mimeType, each.model, each.language, each.audio.byteLength]),
-        connections: fake.connections.map((each) => [each.path, each.query.get("model"), each.query.get("sample_rate"), each.headers["x-api-key"]]),
+        connections: fake.connections.map((each) => [each.path, each.query.get("model"), each.query.get("sample_rate"), each.headers["x-api-key"]]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
         sttPcmBytes: fake.sttPcmBytes,
         drained: fake.drained,
         ttsMessages: fake.ttsMessages.map((each) => [each.context_id, each.transcript, each.continue, each.flush])
@@ -74,13 +74,13 @@ describe("WP6 Speech provider (spec/cloud/services/speechRelay.md)", () => {
         transcribed: [["audio/wav", "ink-whisper", "en", 4], ["audio/wav", "ink-whisper", null, 2]],
         connections: [
           ["/stt/turns/websocket", "ink-2", "16000", secrets.SPEECH_API_KEY],
-          ["/tts/websocket", null, null, secrets.SPEECH_API_KEY],
           ["/stt/turns/websocket", "ink-2", "16000", secrets.SPEECH_API_KEY],
-          ["/stt/turns/websocket", "ink-2", "16000", secrets.SPEECH_API_KEY]
+          ["/stt/turns/websocket", "ink-2", "16000", secrets.SPEECH_API_KEY],
+          ["/tts/websocket", null, null, secrets.SPEECH_API_KEY]
         ],
         sttPcmBytes: 640,
         drained: 1,
-        ttsMessages: [["u1", "Hi", true, true], ["u1", "", false, false]]
+        ttsMessages: [["u1", "Hi", true, true], ["u1", "", false, false], ["u2", undefined, undefined, undefined]]
       }
     ))
   }), 60_000)

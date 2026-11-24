@@ -2,6 +2,7 @@
 // Copied from eliza-develop plugins/plugin-local-inference/native/android/src/main/java/ai/eliza/voice/LiveCaptureController.java
 package ai.eliza.voice;
 
+import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Map;
@@ -14,6 +15,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -93,6 +95,8 @@ public final class LiveCaptureController {
   default void transcript(String id,JSONObject value,String error){}
   /** Sustained speech on a barge-in capture; see {@link Sink#bargeIn}. Runs on the capture thread. */
   default boolean bargeIn(String id,long atMs){return true;}
+  /** Background prewarm hook (for example bundle/VAD/route readiness) so live capture starts immediately. */
+  default void prewarm()throws Exception{}
  }
  /** Opens the owner-bound pipe for one capture; throws when no owner is enrolled. */
  public interface Route { Pipe open(Pipe.Sink sink,String id,String roomId)throws Exception; }
@@ -105,6 +109,8 @@ public final class LiveCaptureController {
  public static final String CANCELLED="Recording cancelled",CAPTURE="capture",PAUSED="paused";
  static final String INTERRUPTED="Voice was interrupted",SESSION_UNAVAILABLE="Agent voice session unavailable";
  static final long PIPE_READY_MS=10000,PIPE_CLOSE_MS=12000;
+ /** Bounded ring buffer of 32 ms frames held in memory while a routed pipe warms in parallel with capture startup. */
+ public static final int PRE_READY_MAX_FRAMES=96;
  public static final int SAMPLE_RATE=16000;
 
  private final Host host;
@@ -114,13 +120,40 @@ public final class LiveCaptureController {
  // being refused as busy. A second waiting task is still refused rather than queued without bound.
  private final ExecutorService stopWorker=new ThreadPoolExecutor(1,1,30,TimeUnit.SECONDS,new ArrayBlockingQueue<>(1));
  private final ExecutorService pipeWorker=new ThreadPoolExecutor(1,1,30,TimeUnit.SECONDS,new ArrayBlockingQueue<>(1));
+ private final ExecutorService prewarmWorker=Executors.newSingleThreadExecutor(work->{
+  Thread thread=new Thread(work,"eliza-live-prewarm");
+  thread.setDaemon(true);
+  return thread;
+ });
+ private final AtomicBoolean prewarming=new AtomicBoolean();
  private final LiveCaptureAdmission admission=new LiveCaptureAdmission();
  private final Map<String,Pipe> pipes=new ConcurrentHashMap<>();
+ private final Map<String,PreReadyBuffer> preBuffers=new ConcurrentHashMap<>();
  private Capture live; // Confined to worker.
  private volatile Capture current; // The running capture, for interruption off worker.
  private volatile String interrupted; // A call or pause since this host's last capture: an automatic reopen is refused.
 
  public LiveCaptureController(Host host){this.host=host;}
+
+ /** Warms the host in the background (coalesced while one prewarm is running); never blocks the caller. */
+ public CompletableFuture<Boolean> prewarm(){return prewarm(null);}
+ /** Runs {@code extra} after {@link Host#prewarm} in the background so capture startup needs no cold wait. */
+ public CompletableFuture<Boolean> prewarm(Runnable extra){
+  CompletableFuture<Boolean> done=new CompletableFuture<>();
+  if(extra==null&&!prewarming.compareAndSet(false,true)){done.complete(true);return done;}
+  submit(prewarmWorker,()->{
+   try{
+    host.prewarm();
+    if(extra!=null)extra.run();
+    done.complete(true);
+   }catch(Exception|Error unavailable){
+    done.complete(false);
+   }finally{
+    if(extra==null)prewarming.set(false);
+   }
+  },()->{if(extra==null)prewarming.set(false);done.complete(false);});
+  return done;
+ }
 
  /** Reserves the admission for {@code id} at the host's {@code epoch}, cancelling any earlier one. */
  public LiveCaptureAdmission.Ticket reserve(String id,long epoch){return admission.begin(id,epoch);}
@@ -148,22 +181,41 @@ public final class LiveCaptureController {
    try{if(live!=null){String old=live.captureId();live.stopAndWait();live=null;current=null;closePipe(old,true,now());}}
    catch(RuntimeException unconfirmed){result.refused("Microphone release is unconfirmed",CAPTURE);return;}
    final Pipe pipe;
+   final PreReadyBuffer preBuffer=route==null?null:new PreReadyBuffer(PRE_READY_MAX_FRAMES);
+   final AtomicBoolean pipeFailed=new AtomicBoolean();
    try{
     pipe=route==null?null:route.open(new Pipe.Sink(){
      public void result(JSONObject value){if(host.open(epoch)&&admission.events(ticket))host.transcript(id,value,null);}
      public void failed(String code){
       if(!admission.events(ticket))return;
       boolean asr="ASR_FAILED".equals(code);
+      if(!asr){
+       if(!pipeFailed.compareAndSet(false,true))return;
+       if(preBuffer!=null)preBuffer.close();
+      }
       if(!asr&&startup.hold(code))return;
       if(!asr)admission.stop(id);host.transcript(id,null,code);
      }
     },id,roomId);
     if(pipe!=null){
      pipes.put(id,pipe);
-     if(!pipe.start(pipeWorker)){pipes.remove(id,pipe);result.refused("Native voice transport busy",null);return;}
+     preBuffers.put(id,preBuffer);
+     if(!pipe.start(pipeWorker)){pipes.remove(id,pipe);preBuffers.remove(id,preBuffer);preBuffer.close();result.refused("Native voice transport busy",null);return;}
      // An interrupt before the pipe was published could not close it: stop waiting for the agent.
      if(!admission.current(ticket))throw new IllegalStateException(CANCELLED);
-     if(!pipe.ready().get(PIPE_READY_MS,TimeUnit.MILLISECONDS))throw new IllegalStateException("Agent voice session unavailable");
+     pipe.ready().thenApply(Boolean.TRUE::equals).orTimeout(PIPE_READY_MS,TimeUnit.MILLISECONDS).whenComplete((ok,err)->{
+      if(Boolean.TRUE.equals(ok)&&err==null&&host.open(epoch)&&admission.events(ticket)){
+       preBuffer.flushTo(pipe);
+      }else{
+       preBuffer.close();
+       if(!Boolean.TRUE.equals(ok)||err!=null){
+        pipe.close(true,now());
+        if(admission.events(ticket)&&pipeFailed.compareAndSet(false,true)){
+         if(!startup.hold("TRANSPORT")){admission.stop(id);host.transcript(id,null,"TRANSPORT");}
+        }
+       }
+      }
+     });
     }
    }catch(Exception unavailable){
     closePipe(id,true,now());
@@ -179,13 +231,13 @@ public final class LiveCaptureController {
     if(!host.canStart(epoch)||!admission.current(ticket)){closePipe(id,true,now());refuse(ticket,startup,result);return;}
     next=host.capture(id,new Sink(){
      private boolean admitted(){return host.open(epoch)&&admission.events(ticket);}
-     public void frames(String captureId,JSONArray frames,JSONArray vad,float peak){if(!admitted())return;host.frames(captureId,pipe==null?frames:new JSONArray(),vad,peak);if(pipe!=null)pipe.offer(frames,vad);}
-     public void ended(String captureId,String error){if(!host.open(epoch)||!admission.end(ticket))return;host.ended(captureId,error);if(error!=null&&pipe!=null)pipe.close(true,now());}
+     public void frames(String captureId,JSONArray frames,JSONArray vad,float peak){if(!admitted())return;host.frames(captureId,pipe==null?frames:new JSONArray(),vad,peak);if(pipe!=null)preBuffer.offer(pipe,frames,vad);}
+     public void ended(String captureId,String error){if(!host.open(epoch)||!admission.end(ticket))return;host.ended(captureId,error);if(error!=null&&pipe!=null){preBuffer.close();pipe.close(true,now());}}
      public boolean bargeIn(String captureId,long atMs){return admitted()&&host.bargeIn(captureId,atMs);}
     },options.reopening(reopen));
    }catch(Exception|Error unavailable){closePipe(id,true,now());result.refused("Live capture could not start",CAPTURE);return;}
    // Publish cancellation before native startup. The callback only marks and schedules: no join on the caller.
-   if(!admission.attach(ticket,()->{next.cancelPending();if(pipe!=null&&!admission.events(ticket))pipe.close(true,now());submit(stopWorker,next::requestStop,()->{/* The capture worker's cleanup still stops this source. */});})){closePipe(id,true,now());refuse(ticket,startup,result);return;}
+   if(!admission.attach(ticket,()->{next.cancelPending();if(pipe!=null&&!admission.events(ticket)){preBuffer.close();pipe.close(true,now());}submit(stopWorker,next::requestStop,()->{/* The capture worker's cleanup still stops this source. */});})){closePipe(id,true,now());refuse(ticket,startup,result);return;}
    try{
     next.start();
     // Published before the ticket runs: an interrupt either refuses this start or reaches the capture.
@@ -212,7 +264,8 @@ public final class LiveCaptureController {
   // Cancelling transport can immediately wake the startup worker. Publish Stop first so that
   // worker observes cancellation when classifying an interrupted warm-up.
   admission.stop(id,discard);
-  if(pipe!=null&&(discard||!pipe.ready().isDone()))pipe.close(true,cutoff);
+  PreReadyBuffer preBuffer=preBuffers.get(id);
+  if(pipe!=null&&(discard||!pipe.ready().isDone())){if(preBuffer!=null)preBuffer.close();pipe.close(true,cutoff);}
   submit(worker,()->{
    long duration=0;
    if(live!=null&&live.captureId().equals(id)){
@@ -234,6 +287,7 @@ public final class LiveCaptureController {
   interrupted=CANCELLED;
   LiveCaptureAdmission.Ticket ended=admission.pause(waiting);
   if(report&&ended!=null)host.ended(ended.id,PAUSED);
+  for(PreReadyBuffer buffer:preBuffers.values())buffer.close();
   for(Pipe pipe:pipes.values())pipe.close(true,now());
   submit(worker,()->{if(live!=null)retire(live);for(String id:pipes.keySet())closePipe(id,true,now());},()->{/* Shut down: its last task stopped the capture. */});
  }
@@ -246,6 +300,10 @@ public final class LiveCaptureController {
   interrupted=reason;
   LiveCaptureAdmission.Ticket pending=admission.interrupt(reason);
   // A start still warming the agent session stops waiting for it.
+  if(pending!=null){
+   PreReadyBuffer warmingBuffer=preBuffers.get(pending.id);
+   if(warmingBuffer!=null)warmingBuffer.close();
+  }
   Pipe warming=pending==null?null:pipes.get(pending.id);
   if(warming!=null)warming.close(true,now());
   Capture active=current;
@@ -273,7 +331,7 @@ public final class LiveCaptureController {
  public void onWorker(Runnable work,Runnable refused){submit(worker,work,refused);}
 
  /** Terminal: cancels everything and stops the workers after their queued cleanup. */
- public void shutdown(){end(Collections.emptySet(),false);worker.shutdown();stopWorker.shutdown();pipeWorker.shutdown();}
+ public void shutdown(){end(Collections.emptySet(),false);worker.shutdown();stopWorker.shutdown();pipeWorker.shutdown();prewarmWorker.shutdown();}
 
  /** A refused start: interrupted (its reason), failed in the pipe (its code) or cancelled. */
  private void refuse(LiveCaptureAdmission.Ticket ticket,Startup startup,Started result){
@@ -291,8 +349,53 @@ public final class LiveCaptureController {
   synchronized boolean report(){if(failure!=null)return false;reported=true;return true;}
  }
 
+ /** Bounded FIFO ring buffer of captured batches while a routed pipe completes its warm-up. */
+ private static final class PreReadyBuffer {
+  private static final class Batch {
+   final JSONArray frames,vad;
+   Batch(JSONArray frames,JSONArray vad){this.frames=frames;this.vad=vad;}
+  }
+  private final int maxFrames;
+  private final ArrayDeque<Batch> queue=new ArrayDeque<>();
+  private int bufferedFrames;
+  private boolean ready,closed;
+
+  PreReadyBuffer(int maxFrames){this.maxFrames=maxFrames;}
+
+  synchronized void offer(Pipe pipe,JSONArray frames,JSONArray vad){
+   if(closed)return;
+   if(ready){pipe.offer(frames,vad);return;}
+   if(frames.length()==0&&vad.length()==0)return;
+   int count=frames.length();
+   if(count>maxFrames)return;
+   while(!queue.isEmpty()&&bufferedFrames+count>maxFrames){
+    bufferedFrames-=queue.removeFirst().frames.length();
+   }
+   queue.addLast(new Batch(frames,vad));
+   bufferedFrames+=count;
+  }
+
+  synchronized void flushTo(Pipe pipe){
+   if(closed||ready)return;
+   ready=true;
+   while(!queue.isEmpty()){
+    Batch batch=queue.removeFirst();
+    bufferedFrames-=batch.frames.length();
+    pipe.offer(batch.frames,batch.vad);
+   }
+  }
+
+  synchronized void close(){
+   closed=true;
+   queue.clear();
+   bufferedFrames=0;
+  }
+ }
+
  /** Waits only on the capture worker, never a bridge or UI thread. False: server close unconfirmed. */
  private boolean closePipe(String id,boolean discard,double at){
+  PreReadyBuffer preBuffer=preBuffers.remove(id);
+  if(preBuffer!=null)preBuffer.close();
   Pipe pipe=pipes.get(id);if(pipe==null)return true;
   try{return pipe.close(discard,at).get(PIPE_CLOSE_MS,TimeUnit.MILLISECONDS);}
   catch(Exception uncertain){pipe.close(true,at);return false;}

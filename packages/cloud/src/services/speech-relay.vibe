@@ -7,7 +7,7 @@ import {
 import { readDevice, validUplink, writeRelay, type RelayWire } from "../client/relay-frames.ts"
 import { refused, type Refused } from "../http/refusal.vibe"
 import type { CloudContext, Route, RouteContext } from "../http/routes.vibe"
-import { openStt, openTts, type SttEdge, type SttLink, type TtsEdge, type TtsLink } from "../providers/speech.vibe"
+import { openRealtimeLinks, openStt, openTts, type RealtimeLinks, type SttEdge, type SttLink, type TtsEdge, type TtsLink } from "../providers/speech.vibe"
 import { relaySession } from "./speech-session.vibe"
 
 export type Failure = { readonly _tag: string }
@@ -39,6 +39,7 @@ export interface RelaySession {
 interface SpeechLinks {
   readonly openStt: () => SttLink!Failure!(Scope.Scope | CloudContext)
   readonly openTts: () => TtsLink!Failure!(Scope.Scope | CloudContext)
+  readonly openRealtime?: () => RealtimeLinks!Failure!(Scope.Scope | CloudContext)
 }
 
 interface RelayPorts {
@@ -296,11 +297,17 @@ effect function openProviders(shell: Shell, ports: RelayPorts, sessionId: string
   const window = openWindow(1, admission.expiresAt)
   shell.windows.push(window)
   shell.current = 1
-  try ports.session.dispatchWindow(sessionId, 1)
-  window.dispatched = true
-  const stt = try ports.links.openStt()
+  const openLinks = ports.links.openRealtime !== undefined
+    ? ports.links.openRealtime()
+    : Effect.all({ stt: ports.links.openStt(), tts: ports.links.openTts() }, { concurrency: 2 })
+  const [, { stt, tts }] = try Effect.all([
+    effect {
+      try ports.session.dispatchWindow(sessionId, 1)
+      window.dispatched = true
+    },
+    openLinks
+  ], { concurrency: 2 })
   shell.stt = stt
-  const tts = try ports.links.openTts()
   shell.tts = tts
   fork.scoped pump(stt.edges, arrivals, (edge) => ({ kind: "stt", edge }))
   fork.scoped pump(tts.edges, arrivals, (edge) => ({ kind: "tts", edge }))
@@ -511,4 +518,4 @@ function relayRoutes(ports: RelayPorts): ReadonlyArray<Route> {
   return [{ method: "GET", path: "/api/v1/voice/speech/ws", auth: "Public", capability: "speech", handler: (context) => relay(ports, context) }]
 }
 
-export const relaySpeechRoutes: ReadonlyArray<Route> = relayRoutes({ session: relaySession, links: { openStt, openTts } })
+export const relaySpeechRoutes: ReadonlyArray<Route> = relayRoutes({ session: relaySession, links: { openStt, openTts, openRealtime: openRealtimeLinks } })

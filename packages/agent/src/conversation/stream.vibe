@@ -18,6 +18,7 @@ module node {
     readonly planAction?: "sign-in" | "funding" | "retry"; readonly retryAfterMs?: number
     readonly cutOffEffect?: "applied"
     readonly action?: { readonly kind: string; readonly validatedCard: boolean; readonly verbatimAsked: boolean }
+    readonly awaitingReview?: boolean
   }
 
   export interface ErrorFrame { readonly type: "error"; readonly code: string; readonly message: string }

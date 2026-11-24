@@ -167,7 +167,7 @@ it.live("Talk to the agent through the cloud speech relay (spec/os/voice/cloudSp
   const person = heard(new AbortController().signal)
   const capture = try promise(() => speech.listen(person.handlers))
   assert.isTrue(capture.fullDuplex)
-  assert.deepStrictEqual(phone.calls, ["start production key-1", "unmute"])
+  assert.deepStrictEqual(phone.calls, ["start production key-1"])
 
   emit(phone, { type: "speech-start" })
   emit(phone, { type: "level", peak: 1.5 })
@@ -189,7 +189,7 @@ it.live("Talk to the agent through the cloud speech relay (spec/os/voice/cloudSp
   assert.strictEqual(started, 1)
   assert.deepStrictEqual(person.ends, [])
   try promise(() => speech.stop())
-  assert.deepStrictEqual(phone.calls, ["start production key-1", "unmute", "mute", "speaker off", "speak Hi there", "stop", "removed"])
+  assert.deepStrictEqual(phone.calls, ["start production key-1", "mute", "speaker off", "speak Hi there", "stop", "removed"])
 })
 
 it.live("A reply completes when its audio played and otherwise settles cancelled (spec/os/voice/cloudSpeech.md, \"A reply settles once: completed when all its audio has played, or cancelled\"; spec/os/voice/cloudSpeech.md, \"A transient focus loss pauses listening and speaking until focus returns\")", () => effect {
@@ -267,6 +267,7 @@ it.live("A turn heard while muted never becomes the next capture's turn (spec/os
   try sleep("5 millis")
   emit(phone, { type: "speech-end", text: "old turn" })
   try promise(() => reopening.settled)
+  assert.deepStrictEqual(phone.calls, ["start production key-1", "mute", "mute", "unmute"])
   assert.deepStrictEqual(first.events, [])
   assert.deepStrictEqual(second.events, [])
 
@@ -306,7 +307,7 @@ it.live("A failure ends the session once and an owner's abort stops it (spec/os/
   try promise(() => next.listen(heard(owned.signal).handlers))
   owned.abort()
   try sleep("5 millis")
-  assert.deepStrictEqual(other.calls, ["start production key-1", "unmute", "stop", "removed"])
+  assert.deepStrictEqual(other.calls, ["start production key-1", "stop", "removed"])
 })
 
 it.live("A key change ends the open session (spec/os/voice/cloudSpeech.md, \"An open session and every waiting batch request run under the current key, and a key change ends them\")", () => effect {
