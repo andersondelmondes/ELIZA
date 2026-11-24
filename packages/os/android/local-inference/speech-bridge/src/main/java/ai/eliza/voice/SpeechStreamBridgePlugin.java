@@ -588,8 +588,7 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
   private void mute(Session own, PluginCall call) {
     own.muted = true;
     Step step = apply(own, new Event.Mute(), null);
-    if (step == null && own.captured && !own.closed.get()) silence(own, own.muteGeneration.incrementAndGet(), SILENCE_FRAMES);
-    if (step == null && own.microphone != null) releaseMicrophone(own, false);
+    if (step == null) releaseMicrophone(own, false);
     releaseListening(own);
     if (call != null) submit(media, call::resolve, () -> call.reject("Voice is closed"));
   }
@@ -604,6 +603,7 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
     if (call != null) own.unmuteCalls.add(call);
     if (s.capture() == CloudSpeechPolicy.Capture.RESERVING) return;
     if (s.focusPaused()) {
+      releaseMicrophone(own, true);
       settleUnmutes(own, true);
       return;
     }
@@ -611,6 +611,7 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
     String refused = granted ? focus.openListening() : null;
     if (refused != null) {
       own.muted = true;
+      releaseMicrophone(own, true);
       refuseUnmutes(own, refused);
       if (call == null) deviceEnded(own, DeviceCause.FOCUS_UNAVAILABLE, refused);
       return;
@@ -619,6 +620,7 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
     if (apply(own, new Event.Unmute(granted), null) != null) return;
     releaseListening(own);
     own.muted = true;
+    releaseMicrophone(own, true);
     settleUnmutes(own, false);
     if (call == null) settleStart(own, false);
   }
@@ -960,6 +962,7 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
     if (own.closed.get()) return;
     if (own.muted || !microphoneGranted()) {
       own.muted = true;
+      releaseMicrophone(own, true);
       settleStart(own, false);
     } else unmute(own, null);
   }
@@ -1000,6 +1003,7 @@ public abstract class SpeechStreamBridgePlugin extends Plugin {
   /** Media thread: reserves the microphone slot as live capture (or attaches the pre-opened one) and reports the answer. */
   private void openMicrophone(Session own) {
     if (own.closed.get() || own.machine.state().capture() != CloudSpeechPolicy.Capture.RESERVING) {
+      closeMicrophone(own);
       settleUnmutes(own, settledAway(own));
       return;
     }
