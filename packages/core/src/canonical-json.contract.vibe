@@ -18,3 +18,30 @@ export const snapshotsHashTheSameInAnyKeyOrder = contract({
   deterministic: true,
   invariant: (value, text) => text !== undefined && canonical(reversedKeys(value)) === text,
 });
+
+const omitSparseHole = (value: Schema.Json): string | undefined => {
+  const sparse: unknown[] = [value, , value];
+  try {
+    return canonicalJsonString(sparse, {
+      ...AGENT_BACKUP_CANONICAL_JSON,
+      sparseArrayHoles: "omit",
+    });
+  } catch {
+    return undefined;
+  }
+};
+
+export const sparseArrayHolesOmittedInOmitMode = contract({
+  input: Schema.Json,
+  run: omitSparseHole,
+  deterministic: true,
+  invariant: (value, text) => {
+    if (text === undefined) return false;
+    const element = canonical(value);
+    if (element === undefined) return false;
+    // "omit" reproduces array.map(fn).join(","): the hole leaves an empty
+    // slot between the two separators, so the sparse array keeps different
+    // digest bytes from the dense array with the same elements.
+    return text === `[${element},,${element}]` && text !== canonical([value, value]);
+  },
+});
