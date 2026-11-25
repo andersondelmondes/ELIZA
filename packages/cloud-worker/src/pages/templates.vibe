@@ -1,8 +1,0 @@
-// spec/cloud/returnPages.md, "Story: Bring me back to the app when its link did not open"; spec/cloud/returnPages.md, "Story: Tell a payer the checkout ended"; spec/cloud/deployment.md, "Story: Serve the deployment from a Worker"
-import { renderedTemplate } from "./rendered.ts"
-
-export service PageTemplates {
-  static readonly key = "@elizaos/cloud/pages/PageTemplates"
-  static readonly defaultValue = () => ({ read: async (file: string) => renderedTemplate(file) })
-  readonly read: (file: string) => Promise<string | undefined>
-}

@@ -1,3 +1,0 @@
-// spec/nativeActionJournal/index.md, "Story: Resume an approved operation after the device restarts"
-export { actionJournalPlugin as registerActionJournal, createActionJournalClient, createDeferredDeletions } from "@elizaos/os-bridges"
-export type { ActionJournalClient, ActionJournalEntry, ActionJournalPlugin, ActionJournalTarget, JournalScope } from "@elizaos/os-bridges"

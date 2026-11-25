@@ -1,5 +1,0 @@
-#!/usr/bin/env node
-// spec/agent/host/process.md, "The exit code is the boot failure's code, else 0 after a clean release and 1 after a failed one"; spec/agent/plugins/bundle.md, "A bundle is built only when its load smoke registered each action once under a non-empty name, each promoted action under a listed top-level umbrella"
-import { runAgentCli } from "./cli.vibe"
-
-runAgentCli({ bundled: [] })

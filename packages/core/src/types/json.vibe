@@ -1,9 +1,0 @@
-// spec/core/index.md, "Compatibility translates asynchronous results without losing failures"; spec/core/packageExports.md, "An admitted pack serves exactly the declared leaves, each free of host-only code"
-export type JsonPrimitive = string | number | boolean | null
-
-export type JsonValue =
-  | JsonPrimitive
-  | JsonValue[]
-  | { [key: string]: JsonValue }
-
-export type JsonObject = { [key: string]: JsonValue }

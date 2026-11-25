@@ -1,7 +1,0 @@
-{
-  "extends": "./tsconfig.build.json",
-  "include": [
-    "src/worker.vibe",
-    "src/store/store.vibe"
-  ]
-}
