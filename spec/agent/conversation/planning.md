@@ -735,10 +735,10 @@ text with tool calls that is not cue-shaped (it is long, asks a question or
 carries data), is never spoken as acknowledgment.
 
 ```quint
-type DraftShape = Blank | CueShaped | CueBesideCall | CueBesideObject | OtherText
+type DraftShape = Blank | CueShaped | CueBesideCall | CueBesideObject | OtherText | HostText
 pure def readDraft(shape: DraftShape, calls: int): Draft = match shape {
   | Blank => Silent | CueShaped => if (calls > 0) Cue else Answer | CueBesideCall => Cue
-  | CueBesideObject => if (calls > 0) Cue else MaybeAnswer | OtherText => Answer
+  | CueBesideObject => if (calls > 0) Cue else MaybeAnswer | OtherText => Answer | HostText => Silent
 }
 pure def lawACueComesOnlyWithToolCallsOrBesideAWrittenCall(shape: DraftShape, calls: int): bool =
   (readDraft(shape, calls) == Cue) iff (shape == CueBesideCall or (calls > 0 and (shape == CueShaped or shape == CueBesideObject)))
@@ -826,6 +826,40 @@ pure def lawOnlyACueTheStreamTookIsDelivered(draft: Draft, calls: int, earlierCa
   not(cueDelivered(draft, calls, earlierCalls, false))
 pure def lawOnlyTheTurnsAcknowledgmentIsDelivered(draft: Draft, calls: int, earlierCalls: int, streamTook: bool): bool =
   cueDelivered(draft, calls, earlierCalls, streamTook) implies acknowledges(draft, calls, earlierCalls)
+```
+
+### Text that repeats the agent host's notes is never delivered or streamed, and is asked again once as a blank
+
+The host's notes are for the model only, and the owner never sees the host's
+label or a note's lead line. A response whose text holds the label, `Note
+from the agent host`, or the opening line of a note this turn carried to
+the model (the host's own lead, such as the line that introduces the screen
+context, or the clock's line, with or without its closing colon or period),
+in any letter case, with any spacing, or with a hyphen or underscore
+between its words, is the host's words, never an answer, whether the model
+echoes a note, quotes its lead or writes one of its own under the label: it
+reads as a blank. The notes a reply is written again with (a failure the
+reply left unreported, an attachment omission, a time or event time the
+reply got wrong) count as notes of the turn for the answer they ask for.
+With no tool call it is asked again once (above), and when the response
+after that note holds it again, the turn's failure fallback is the reply.
+Beside tool calls it is no cue, so the owner hears nothing and the tools
+still run. A `REPLY` call whose text holds it gives no reply, and a second
+answer that holds it is no second answer. The reply stream shows the
+model's text only up to where the label or such a line could begin; what
+follows is shown once it can no longer be one, or with the reply, so
+neither the label nor a note's lead line is ever streamed, spoken or
+stored. A note's later lines are not held: they carry the owner's own
+data, such as the page they are reading, which a true answer may quote.
+The notes stay in the model's request as they are.
+
+```quint
+pure def lawHostTextIsNeverAnAnswer(calls: int): bool = readDraft(HostText, calls) == Silent
+pure def lawHostTextIsAskedAgainOnceAndNeverDelivered(stepsLeft: int, askedAgain: bool): bool =
+  nextMove(readDraft(HostText, 0), 0, stepsLeft, askedAgain) != Deliver
+pure def lawHostTextNeverAcknowledges(calls: int, earlierCalls: int): bool =
+  not(acknowledges(readDraft(HostText, calls), calls, earlierCalls))
+pure def lawHostTextIsNoSecondAnswer(sameAsFirst: bool): bool = not(answeredAgain(readDraft(HostText, 0), sameAsFirst))
 ```
 
 ### A tool's progress names its app only when one labelled app applies, and never its arguments or results
